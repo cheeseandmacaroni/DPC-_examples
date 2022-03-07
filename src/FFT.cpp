@@ -44,7 +44,7 @@ inline T m_reverse(T a, int bit_len)
 	return res;
 }
 
-void my_fft_heterogenous(sycl::queue q, size_t size, float *src_real, float *src_imag) //number of threads = number of butterflies
+void my_fft_heterogeneous(sycl::queue q, size_t size, float *src_real, float *src_imag) //number of threads = number of butterflies
 {
 	int bit_length = log2(size);
 	int iterations = bit_length;
