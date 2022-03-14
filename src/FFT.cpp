@@ -2,6 +2,8 @@
 #include <iostream>
 #include <mkl_dfti.h>
 #include <complex>
+#include <omp.h>
+
 #define GROUP_SIZE 256
 #define GROUP_COUNT 32
 #define THREAD_COUNT (GROUP_SIZE * GROUP_COUNT)
@@ -69,10 +71,11 @@ void m_FFT_vectorized(el_type *src_real, el_type *src_im, el_type *res_real, el_
 }
 
 //number of threads = number of butterflies
-void my_fft_heterogeneous(sycl::queue& q, size_t size, float *src_real, float *src_imag) 
+double my_fft_heterogeneous(sycl::queue& q, size_t size, float *src_real, float *src_imag) 
 {
 	int bit_length = log2(size);
 	int iterations = bit_length;
+	double elapsed_time = 0;
 	for (size_t i = 1; i < size - 1; ++i) //pre permutation algorithm
 	{
 		size_t j = m_reverse(i, bit_length);
@@ -82,9 +85,9 @@ void my_fft_heterogeneous(sycl::queue& q, size_t size, float *src_real, float *s
 	}
 	try
 	{
-		sycl::buffer<float, 1> real_buf(src_real, size);
-		sycl::buffer<float, 1> imag_buf(src_imag, size);
-		/*float* real = sycl::malloc_device<float>(size, q);
+		//sycl::buffer<float, 1> real_buf(src_real, size);
+		//sycl::buffer<float, 1> imag_buf(src_imag, size);
+		float* real = sycl::malloc_device<float>(size, q);
 		float* imag = sycl::malloc_device<float>(size, q);
 		q.submit([&](sycl::handler &cgh)
 		{
@@ -93,17 +96,18 @@ void my_fft_heterogeneous(sycl::queue& q, size_t size, float *src_real, float *s
 		q.submit([&](sycl::handler &cgh)
 		{
 			q.memcpy(imag, src_imag, size * sizeof(float));
-		}).wait_and_throw();*/
-		q.submit([&](sycl::handler &cgh)
+		}).wait_and_throw();
+		for (size_t i = 0; i < iterations; ++i)
 		{
-			auto real = real_buf.get_access<sycl::access::mode::read_write>(cgh);
-			auto imag = imag_buf.get_access<sycl::access::mode::read_write>(cgh);
-			cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(size / 2), sycl::range<1>(GROUP_SIZE)),
-				[=](sycl::nd_item<1> item)
+			auto ev = q.submit([&](sycl::handler &cgh)
 			{
-				size_t stride = 1;
-				for (size_t i = 0; i < iterations; ++i)
+				//auto real = real_buf.get_access<sycl::access::mode::read_write>(cgh);
+				//auto imag = imag_buf.get_access<sycl::access::mode::read_write>(cgh);
+
+				cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(size / 2), sycl::range<1>(GROUP_SIZE)),
+					[=](sycl::nd_item<1> item)
 				{
+					size_t stride = 1ull << i;
 					size_t first_adress = item.get_global_id(0) % stride + (item.get_global_id(0) / stride * 2 * stride);
 					size_t t = item.get_global_id(0) % stride;
 					size_t second_adress = first_adress + stride;
@@ -119,14 +123,13 @@ void my_fft_heterogeneous(sycl::queue& q, size_t size, float *src_real, float *s
 					imag[first_adress] = temp_imag_first_adress;
 					real[second_adress] = temp_real_second_adress;
 					imag[second_adress] = temp_imag_second_adress;
-					
-					stride *= 2;
-					//wait for every thread to finish within one iteration
-					item.barrier(); 
-				}
+				});
+
 			});
-		}).wait_and_throw();
-		/*q.submit([&](sycl::handler &cgh)
+			ev.wait_and_throw();
+			elapsed_time += ((ev.get_profiling_info<sycl::info::event_profiling::command_end>() - ev.get_profiling_info<sycl::info::event_profiling::command_start>()) / 1.0e9);
+		}
+		q.submit([&](sycl::handler &cgh)
 		{
 			q.memcpy(src_real, real, size * sizeof(float));
 		}).wait_and_throw();
@@ -134,8 +137,9 @@ void my_fft_heterogeneous(sycl::queue& q, size_t size, float *src_real, float *s
 		{
 			q.memcpy(src_imag, imag, size * sizeof(float));
 		}).wait_and_throw();
-		sycl::free(real, q);
-		sycl::free(imag, q);*/
+		//sycl::free(real, q);
+		//sycl::free(imag, q);
+		return elapsed_time;
 	}
 	catch (sycl::exception &e)
 	{
@@ -148,8 +152,9 @@ void my_fft_heterogeneous(sycl::queue& q, size_t size, float *src_real, float *s
 }
 
 int main() {
-	float eps = 0.001;
-	size_t size = 1024;
+	float eps = 0.1;
+	size_t size = 1ull << 25;
+	double ffth_start = 0,ffth_time = 0, fftv_start = 0, fftv_time = 0;
 	float* real = static_cast<float *>(malloc(size * sizeof(float)));
 	float* imag = static_cast<float *>(malloc(size * sizeof(float)));
 	float* correct_real = new float[size];
@@ -159,9 +164,13 @@ int main() {
 		correct_real[i] = real[i] = rand() % 2000 / 1000.f - 1;
 		correct_imag[i] = imag[i] = rand() % 2000 / 1000.f - 1;
 	}
-	sycl::queue Q(sycl::default_selector{});
+	sycl::queue Q(sycl::default_selector{}, sycl::property::queue::enable_profiling());
+	ffth_start = omp_get_wtime();
 	my_fft_heterogeneous(Q, size, real, imag);
+	ffth_time = omp_get_wtime() - ffth_start;
+	fftv_start = omp_get_wtime();
 	m_FFT_vectorized(correct_real, correct_imag, correct_real, correct_imag, size, 1);
+	fftv_time = omp_get_wtime() - fftv_start;
 	bool flag = true;
 	int max_output_count = 20;
 	for (size_t i = 0; i < size; i++)
@@ -170,12 +179,13 @@ int main() {
 		{
 			if (max_output_count > 0)
 			{
-				std::cout << correct_real[i] << ' ' << correct_imag[i] << '\t' << real[i] << ' ' << imag[i] << std::endl;
+				std::cout << i << ' ' << correct_real[i] << ' ' << correct_imag[i] << '\t' << real[i] << ' ' << imag[i] << std::endl;
 				max_output_count--;
 			}
 			flag = false;
 		}
 	}
-	std::cout << flag;
+	std::cout.precision(3);
+	std::cout << flag << std::endl << "OMP: " << fftv_time << std::endl << "DPC++ " << ffth_time << std::endl;
 	return 0;
 }
